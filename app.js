@@ -10,6 +10,11 @@ let recognition = null;
 let isListening = false;
 let finalTranscript = '';
 let interimTranscript = '';
+let restartAttempts = 0;
+const MAX_RESTART_ATTEMPTS = 3;
+let silenceTimer = null;
+let isProcessingRestart = false;
+let confidenceThreshold = 0.7; // Adjustable confidence threshold
 
 const micButton = document.getElementById('micButton');
 const textOutput = document.getElementById('textOutput');
@@ -19,44 +24,84 @@ const clearBtn = document.getElementById('clearBtn');
 const status = document.getElementById('status');
 const languageSelect = document.getElementById('languageSelect');
 
-// Initialize speech recognition
+// Enhanced initialization with better settings
 function initRecognition() {
     if (!SpeechRecognition) return;
     
     recognition = new SpeechRecognition();
+    
+    // Enhanced settings for better accuracy
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+    recognition.maxAlternatives = 3; // Get multiple alternatives for better accuracy
     recognition.lang = languageSelect.value;
+    
+    // Enhanced audio settings (if supported)
+    if ('webkitSpeechRecognition' in window) {
+        recognition.serviceURI = 'wss://www.google.com/speech-api/full-duplex/v1/up';
+    }
     
     recognition.onstart = () => {
         isListening = true;
+        restartAttempts = 0;
+        isProcessingRestart = false;
         micButton.classList.add('listening');
-        status.textContent = 'Listening...';
-        status.className = 'status listening';
+        updateStatus('Listening... Speak clearly into your microphone', 'listening');
         
         if (textOutput.classList.contains('empty')) {
             textOutput.textContent = '';
             textOutput.classList.remove('empty');
         }
+        
+        // Set up silence detection
+        setupSilenceDetection();
     };
     
     recognition.onresult = (event) => {
-        interimTranscript = '';
+        // Reset silence timer when we get results
+        resetSilenceTimer();
         
+        let newInterimTranscript = '';
+        let newFinalTranscript = '';
+        
+        // Process all results with confidence filtering
         for (let i = event.resultIndex; i < event.results.length; i++) {
-            const transcript = event.results[i][0].transcript;
+            const result = event.results[i];
             
-            if (event.results[i].isFinal) {
-                finalTranscript += transcript + ' ';
+            // Use the best alternative based on confidence
+            let bestTranscript = '';
+            let bestConfidence = 0;
+            
+            for (let j = 0; j < result.length; j++) {
+                const alternative = result[j];
+                if (alternative.confidence > bestConfidence) {
+                    bestConfidence = alternative.confidence;
+                    bestTranscript = alternative.transcript;
+                }
+            }
+            
+            // Only use results above confidence threshold
+            if (bestConfidence >= confidenceThreshold || result.isFinal) {
+                if (result.isFinal) {
+                    newFinalTranscript += bestTranscript + ' ';
+                    updateStatus(`Confidence: ${Math.round(bestConfidence * 100)}%`, 'success');
+                } else {
+                    newInterimTranscript += bestTranscript;
+                }
             } else {
-                interimTranscript += transcript;
+                // Low confidence - show warning
+                updateStatus(`Low confidence (${Math.round(bestConfidence * 100)}%) - speak more clearly`, 'warning');
             }
         }
         
-        // Update the text output
-        const displayText = finalTranscript + (interimTranscript ? `<span class="interim-text">${interimTranscript}</span>` : '');
-        textOutput.innerHTML = displayText || '<span class="empty">Press the microphone button and start speaking...</span>';
+        // Update transcripts
+        if (newFinalTranscript) {
+            finalTranscript += newFinalTranscript;
+        }
+        interimTranscript = newInterimTranscript;
+        
+        // Update display with better formatting
+        updateTextDisplay();
         
         // Auto-scroll to bottom
         textOutput.scrollTop = textOutput.scrollHeight;
@@ -64,32 +109,137 @@ function initRecognition() {
     
     recognition.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
-        status.textContent = `Error: ${event.error}`;
-        status.className = 'status';
         
-        if (event.error === 'no-speech') {
-            status.textContent = 'No speech detected. Try again.';
-        } else if (event.error === 'not-allowed') {
-            status.textContent = 'Microphone access denied. Please allow microphone access and reload.';
+        const errorMessages = {
+            'no-speech': 'No speech detected. Make sure your microphone is working and try speaking louder.',
+            'audio-capture': 'Microphone not found or accessible. Check your microphone connection.',
+            'not-allowed': 'Microphone access denied. Please allow microphone access and reload the page.',
+            'network': 'Network error. Check your internet connection.',
+            'aborted': 'Speech recognition was aborted.',
+            'language-not-supported': 'Selected language is not supported.',
+            'service-not-allowed': 'Speech recognition service not allowed.'
+        };
+        
+        const errorMessage = errorMessages[event.error] || `Error: ${event.error}`;
+        updateStatus(errorMessage, 'error');
+        
+        // Auto-restart on certain errors
+        if (['no-speech', 'audio-capture', 'network'].includes(event.error) && 
+            restartAttempts < MAX_RESTART_ATTEMPTS && isListening) {
+            setTimeout(() => {
+                if (isListening && !isProcessingRestart) {
+                    restartRecognition();
+                }
+            }, 1000);
+        } else {
+            stopListening();
         }
-        
-        stopListening();
     };
     
     recognition.onend = () => {
-        isListening = false;
-        micButton.classList.remove('listening');
-        
-        if (finalTranscript) {
-            status.textContent = 'Recording stopped';
-            status.className = 'status';
-        } else {
-            status.textContent = '';
+        if (silenceTimer) {
+            clearTimeout(silenceTimer);
         }
         
-        // Clean up interim results
-        textOutput.innerHTML = finalTranscript || '<span class="empty">Press the microphone button and start speaking...</span>';
+        // Auto-restart if we should still be listening
+        if (isListening && !isProcessingRestart && restartAttempts < MAX_RESTART_ATTEMPTS) {
+            setTimeout(() => {
+                if (isListening) {
+                    restartRecognition();
+                }
+            }, 100);
+        } else {
+            isListening = false;
+            micButton.classList.remove('listening');
+            
+            if (finalTranscript) {
+                updateStatus('Recording stopped', 'default');
+            } else {
+                updateStatus('', 'default');
+            }
+            
+            // Clean up interim results
+            updateTextDisplay(true);
+        }
     };
+}
+
+// Restart recognition with backoff
+function restartRecognition() {
+    if (isProcessingRestart || restartAttempts >= MAX_RESTART_ATTEMPTS) {
+        return;
+    }
+    
+    isProcessingRestart = true;
+    restartAttempts++;
+    
+    updateStatus(`Reconnecting... (${restartAttempts}/${MAX_RESTART_ATTEMPTS})`, 'warning');
+    
+    setTimeout(() => {
+        if (isListening && recognition) {
+            try {
+                recognition.lang = languageSelect.value;
+                recognition.start();
+            } catch (e) {
+                console.error('Restart failed:', e);
+                stopListening();
+            }
+        }
+        isProcessingRestart = false;
+    }, 500 * restartAttempts); // Exponential backoff
+}
+
+// Silence detection to restart recognition
+function setupSilenceDetection() {
+    resetSilenceTimer();
+}
+
+function resetSilenceTimer() {
+    if (silenceTimer) {
+        clearTimeout(silenceTimer);
+    }
+    
+    // Restart after 10 seconds of silence
+    silenceTimer = setTimeout(() => {
+        if (isListening && !isProcessingRestart) {
+            updateStatus('Silence detected - restarting...', 'warning');
+            restartRecognition();
+        }
+    }, 10000);
+}
+
+// Enhanced status update function
+function updateStatus(message, type = 'default') {
+    status.textContent = message;
+    status.className = `status ${type}`;
+    
+    // Auto-clear success/warning messages
+    if (['success', 'warning'].includes(type)) {
+        setTimeout(() => {
+            if (status.className.includes(type)) {
+                status.textContent = isListening ? 'Listening...' : '';
+                status.className = 'status';
+            }
+        }, 3000);
+    }
+}
+
+// Enhanced text display update
+function updateTextDisplay(final = false) {
+    if (final) {
+        textOutput.innerHTML = finalTranscript || '<span class="empty">Press the microphone button and start speaking...</span>';
+        if (!finalTranscript) {
+            textOutput.classList.add('empty');
+        }
+        return;
+    }
+    
+    const displayText = finalTranscript + (interimTranscript ? `<span class="interim-text">${interimTranscript}</span>` : '');
+    textOutput.innerHTML = displayText || '<span class="empty">Press the microphone button and start speaking...</span>';
+    
+    if (displayText) {
+        textOutput.classList.remove('empty');
+    }
 }
 
 function startListening() {
@@ -98,20 +248,37 @@ function startListening() {
     }
     
     if (recognition && !isListening) {
+        restartAttempts = 0;
         recognition.lang = languageSelect.value;
-        recognition.start();
+        
+        // Request microphone permission explicitly
+        navigator.mediaDevices.getUserMedia({ audio: true })
+            .then(() => {
+                recognition.start();
+            })
+            .catch((error) => {
+                updateStatus('Microphone access required. Please grant permission and try again.', 'error');
+                console.error('Microphone permission error:', error);
+            });
     }
 }
 
 function stopListening() {
     if (recognition && isListening) {
-        recognition.stop();
         isListening = false;
+        isProcessingRestart = false;
+        
+        if (silenceTimer) {
+            clearTimeout(silenceTimer);
+        }
+        
+        recognition.stop();
         micButton.classList.remove('listening');
+        updateStatus('Stopping...', 'default');
     }
 }
 
-// Event listeners
+// Enhanced event listeners
 micButton.addEventListener('click', () => {
     if (isListening) {
         stopListening();
@@ -120,20 +287,29 @@ micButton.addEventListener('click', () => {
     }
 });
 
+// Language change handler with restart
+languageSelect.addEventListener('change', () => {
+    if (isListening) {
+        const wasListening = isListening;
+        stopListening();
+        setTimeout(() => {
+            if (wasListening) {
+                startListening();
+            }
+        }, 500);
+    }
+});
+
 copyBtn.addEventListener('click', async () => {
     const text = finalTranscript.trim();
     if (!text) {
-        status.textContent = 'Nothing to copy';
-        status.className = 'status';
-        setTimeout(() => status.textContent = '', 2000);
+        updateStatus('Nothing to copy', 'warning');
         return;
     }
     
     try {
         await navigator.clipboard.writeText(text);
-        status.textContent = 'Copied to clipboard!';
-        status.className = 'status success';
-        setTimeout(() => status.textContent = '', 2000);
+        updateStatus(`Copied ${text.length} characters!`, 'success');
     } catch (err) {
         // Fallback for older browsers
         const textarea = document.createElement('textarea');
@@ -142,62 +318,72 @@ copyBtn.addEventListener('click', async () => {
         textarea.select();
         document.execCommand('copy');
         document.body.removeChild(textarea);
-        status.textContent = 'Copied to clipboard!';
-        status.className = 'status success';
-        setTimeout(() => status.textContent = '', 2000);
+        updateStatus(`Copied ${text.length} characters!`, 'success');
     }
 });
 
 exportBtn.addEventListener('click', () => {
     const text = finalTranscript.trim();
     if (!text) {
-        status.textContent = 'Nothing to export';
-        status.className = 'status';
-        setTimeout(() => status.textContent = '', 2000);
+        updateStatus('Nothing to export', 'warning');
         return;
     }
     
-    const blob = new Blob([text], { type: 'text/plain' });
+    // Enhanced export with metadata
+    const timestamp = new Date().toISOString();
+    const exportText = `Speech-to-Text Export
+Generated: ${timestamp}
+Language: ${languageSelect.options[languageSelect.selectedIndex].text}
+Word Count: ${text.split(/\s+/).length}
+Character Count: ${text.length}
+
+---
+
+${text}`;
+    
+    const blob = new Blob([exportText], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `speech-to-text-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.download = `speech-to-text-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     
-    status.textContent = 'Exported successfully!';
-    status.className = 'status success';
-    setTimeout(() => status.textContent = '', 2000);
+    updateStatus('Exported successfully!', 'success');
 });
 
 clearBtn.addEventListener('click', () => {
-    finalTranscript = '';
-    interimTranscript = '';
-    textOutput.innerHTML = '<span class="empty">Press the microphone button and start speaking...</span>';
-    textOutput.classList.add('empty');
-    status.textContent = 'Cleared';
-    status.className = 'status';
-    setTimeout(() => status.textContent = '', 2000);
+    if (finalTranscript || interimTranscript) {
+        if (confirm('Are you sure you want to clear all text?')) {
+            finalTranscript = '';
+            interimTranscript = '';
+            updateTextDisplay(true);
+            updateStatus('Cleared', 'success');
+        }
+    } else {
+        updateStatus('Nothing to clear', 'warning');
+    }
 });
 
-// Handle direct editing in the text output
+// Enhanced text editing
 textOutput.addEventListener('input', () => {
     finalTranscript = textOutput.innerText;
     textOutput.classList.remove('empty');
 });
 
-// Keyboard shortcuts
+// Enhanced keyboard shortcuts
 document.addEventListener('keydown', (e) => {
     // Space bar to toggle recording (when not editing)
-    if (e.code === 'Space' && document.activeElement !== textOutput) {
+    if (e.code === 'Space' && document.activeElement !== textOutput && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
         micButton.click();
     }
     
     // Ctrl/Cmd + C to copy
     if ((e.ctrlKey || e.metaKey) && e.key === 'c' && document.activeElement !== textOutput) {
+        e.preventDefault();
         copyBtn.click();
     }
     
@@ -207,11 +393,79 @@ document.addEventListener('keydown', (e) => {
         exportBtn.click();
     }
     
+    // Ctrl/Cmd + Backspace to clear
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Backspace') {
+        e.preventDefault();
+        clearBtn.click();
+    }
+    
     // Escape to stop recording
     if (e.key === 'Escape' && isListening) {
+        e.preventDefault();
         stopListening();
     }
 });
 
-// Initialize on load
-initRecognition();
+// Enhanced microphone test function
+async function testMicrophone() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        source.connect(analyser);
+        
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        
+        let avgVolume = 0;
+        const checkVolume = () => {
+            analyser.getByteFrequencyData(dataArray);
+            const sum = dataArray.reduce((a, b) => a + b, 0);
+            avgVolume = sum / bufferLength;
+            
+            if (avgVolume > 10) {
+                updateStatus('Microphone is working! Volume detected.', 'success');
+                stream.getTracks().forEach(track => track.stop());
+                audioContext.close();
+            } else {
+                requestAnimationFrame(checkVolume);
+            }
+        };
+        
+        updateStatus('Testing microphone... Please speak.', 'warning');
+        checkVolume();
+        
+        // Timeout the test after 5 seconds
+        setTimeout(() => {
+            if (avgVolume <= 10) {
+                updateStatus('Microphone test timeout. Check your microphone.', 'error');
+                stream.getTracks().forEach(track => track.stop());
+                audioContext.close();
+            }
+        }, 5000);
+        
+    } catch (error) {
+        updateStatus('Microphone test failed. Check permissions and hardware.', 'error');
+        console.error('Microphone test error:', error);
+    }
+}
+
+// Confidence threshold adjustment (you can expose this in UI)
+function setConfidenceThreshold(threshold) {
+    confidenceThreshold = Math.max(0.1, Math.min(1.0, threshold));
+    updateStatus(`Confidence threshold set to ${Math.round(confidenceThreshold * 100)}%`, 'success');
+}
+
+// Initialize on load with enhanced error handling
+document.addEventListener('DOMContentLoaded', () => {
+    initRecognition();
+    
+    // Add microphone test button functionality if it exists
+    const testBtn = document.getElementById('testMicBtn');
+    if (testBtn) {
+        testBtn.addEventListener('click', testMicrophone);
+    }
+    
+    updateStatus('Ready to start speech recognition', 'default');
+});
